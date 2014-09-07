@@ -153,7 +153,7 @@ describe('ngSocket', function () {
         ngSocketBackend.expectConnect(url);
         var ws = ngSocket(url);
         var spy = spyOn(ws, 'reconnect');
-        ws._onCloseHandler({statusCode: 5000});
+        ws._onCloseHandler({code: 4000});
         expect(spy).toHaveBeenCalled();
         ngSocketBackend.flush();
       });
@@ -576,7 +576,7 @@ describe('ngSocket', function () {
         ngSocketBackend.expectConnect(url);
         var ws = ngSocket(url);
         expect(ws._reconnectableStatusCodes.length).toBe(1);
-        expect(ws._reconnectableStatusCodes).toEqual([5000])
+        expect(ws._reconnectableStatusCodes).toEqual([4000])
         ngSocketBackend.flush();
       });
 
