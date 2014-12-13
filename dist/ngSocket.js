@@ -4,7 +4,7 @@ angular.module('ngSocketMock', []).
         closeQueue = [], pendingCloses = [],
         sendQueue = [], pendingSends = [];
 
-    function MockWebSocket (url) {};
+    function MockWebSocket (url) {}
     MockWebSocket.prototype.send = function (msg) {
       pendingSends.push(msg);
     };
@@ -87,12 +87,18 @@ angular.module('ngSocket', []).
   factory('ngWebSocket', ['ngSocket', function(ngSocket){
     return ngSocket;
   }]).
-  factory('ngSocket', ['$rootScope', '$q', 'ngSocketBackend', function ($rootScope, $q, ngSocketBackend) {
+  factory('ngSocket', ['$rootScope', '$q', '$timeout', 'ngSocketBackend', function ($rootScope, $q, $timeout, ngSocketBackend) {
       var NGWebSocket = function (url) {
         this.url = url;
+        this._reconnectAttempts = 0;
+        this.initialTimeout = 500; // 500ms
+        this.maxTimeout = 5 * 60 * 1000; // 5 minutes
         this.sendQueue = [];
         this.onOpenCallbacks = [];
         this.onMessageCallbacks = [];
+        this.onCloseCallbacks = [];
+        this.onErrorCallbacks = [];
+        this.fromJson = false;
         Object.freeze(this._readyStateConstants);
 
         this._connect();
@@ -107,7 +113,7 @@ angular.module('ngSocket', []).
       };
 
       NGWebSocket.prototype._reconnectableStatusCodes = [
-        5000
+        4000
       ];
 
       NGWebSocket.prototype.close = function (force) {
@@ -118,9 +124,10 @@ angular.module('ngSocket', []).
 
       NGWebSocket.prototype._connect = function (force) {
         if (force || !this.socket || this.socket.readyState !== 1) {
-          this.socket = ngSocketBackend.createWebSocketBackend(this.url)
+          this.socket = ngSocketBackend.createWebSocketBackend(this.url);
           this.socket.onopen = this._onOpenHandler.bind(this);
           this.socket.onmessage = this._onMessageHandler.bind(this);
+          this.socket.onerror = this._onErrorHandler.bind(this);
           this.socket.onclose = this._onCloseHandler.bind(this);
         }
       };
@@ -131,9 +138,9 @@ angular.module('ngSocket', []).
             this.socket.readyState === 1) {
           var data = this.sendQueue.shift();
 
-          this.socket.send(typeof data === 'string'?
-            data :
-            JSON.stringify(data));
+          this.socket.send(typeof data.message === 'string'?
+            data.message :
+            JSON.stringify(data.message));
           data.deferred.resolve();
         }
       };
@@ -141,6 +148,18 @@ angular.module('ngSocket', []).
       NGWebSocket.prototype.notifyOpenCallbacks = function () {
         for (var i = 0; i < this.onOpenCallbacks.length; i++) {
           this.onOpenCallbacks[i].call(this);
+        }
+      };
+
+      NGWebSocket.prototype.notifyCloseCallbacks = function () {
+        for (var i = 0; i < this.onCloseCallbacks.length; i++) {
+          this.onCloseCallbacks[i].call(this);
+        }
+      };
+
+      NGWebSocket.prototype.notifyErrorCallbacks = function (event) {
+        for (var i = 0; i < this.onErrorCallbacks.length; i++) {
+          this.onErrorCallbacks[i].call(this, event);
         }
       };
 
@@ -156,26 +175,34 @@ angular.module('ngSocket', []).
         this.onMessageCallbacks.push({
           fn: callback,
           pattern: options? options.filter : undefined,
-          autoApply: options? options.autoApply : true
+          autoApply: options? options.autoApply : true,
+          fromJson: options? options.fromJson : this.fromJson
         });
       };
 
       NGWebSocket.prototype._onMessageHandler = function (message) {
-        var pattern, socket = this;
+        var pattern, jsonString, socket = this;
+
+        try {
+          jsonString = JSON.parse(message.data)
+        } catch (e) { }
+
         for (var i = 0; i < socket.onMessageCallbacks.length; i++) {
+          var callbackMessage = socket.onMessageCallbacks[i].fromJson && jsonString ? jsonString : message;
+
           pattern = socket.onMessageCallbacks[i].pattern;
           if (pattern) {
             if (typeof pattern === 'string' && message.data === pattern) {
-              socket.onMessageCallbacks[i].fn.call(this, message);
+              socket.onMessageCallbacks[i].fn.call(this, callbackMessage);
               safeDigest();
             }
             else if (pattern instanceof RegExp && pattern.exec(message.data)) {
-              socket.onMessageCallbacks[i].fn.call(this, message);
+              socket.onMessageCallbacks[i].fn.call(this, callbackMessage);
               safeDigest();
             }
           }
           else {
-            socket.onMessageCallbacks[i].fn.call(this, message);
+            socket.onMessageCallbacks[i].fn.call(this, callbackMessage);
             safeDigest();
           }
         }
@@ -187,17 +214,31 @@ angular.module('ngSocket', []).
         }
       };
 
+      NGWebSocket.prototype.onClose = function (cb) {
+        this.onCloseCallbacks.push(cb);
+      };
+
       NGWebSocket.prototype.onOpen = function (cb) {
         this.onOpenCallbacks.push(cb);
       };
 
       NGWebSocket.prototype._onOpenHandler = function () {
+        this._reconnectAttempts = 0;
         this.notifyOpenCallbacks();
         this.fireQueue();
       };
 
+      NGWebSocket.prototype.onError = function (cb) {
+        this.onErrorCallbacks.push(cb);
+      };
+
+      NGWebSocket.prototype._onErrorHandler = function (event) {
+        this.notifyErrorCallbacks(event);
+      };
+
       NGWebSocket.prototype._onCloseHandler = function (event) {
-        if (this._reconnectableStatusCodes.indexOf(event.statusCode) > -1) {
+        this.notifyCloseCallbacks();
+        if (this._reconnectableStatusCodes.indexOf(event.code) > -1) {
           this.reconnect();
         }
       };
@@ -239,7 +280,20 @@ angular.module('ngSocket', []).
       };
 
       NGWebSocket.prototype.reconnect = function () {
+        this.close();
+        $timeout(angular.bind(this, function () { this._connect(); }), this._getBackoffDelay(++this._reconnectAttempts));
+      };
 
+      // Exponential Backoff Formula by Prof. Douglas Thain
+      // http://dthain.blogspot.co.uk/2009/02/exponential-backoff-in-distributed.html
+      NGWebSocket.prototype._getBackoffDelay = function(attempt) {
+        var R = Math.random() + 1,
+            T = this.initialTimeout,
+            F = 2,
+            N = attempt,
+            M = this.maxTimeout;
+
+        return Math.floor(Math.min(R * T * Math.pow(F, N), M));
       };
 
       NGWebSocket.prototype._setInternalState = function(state) {
@@ -254,12 +308,10 @@ angular.module('ngSocket', []).
         });
       };
 
-      NGWebSocket.prototype.__defineGetter__('readyState', function () {
-        return this._internalConnectionState || this.socket.readyState;
-      });
-
-      NGWebSocket.prototype.__defineSetter__('readyState', function (input) {
-        throw new Error('The readyState property is read-only');
+      Object.defineProperty(NGWebSocket.prototype, 'readyState', {
+        get: function() {
+          return this._internalConnectionState || this.socket.readyState;
+        }
       });
 
       return function (url) {
